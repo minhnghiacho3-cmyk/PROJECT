@@ -1,0 +1,1214 @@
+import streamlit as st
+from PIL import Image
+from io import BytesIO
+import pandas as pd
+import numpy as np
+import cv2
+import os
+import tempfile
+import io
+import time
+import contextlib
+import shutil
+import subprocess
+import joblib
+from collections import Counter
+from datetime import datetime
+from ultralytics import YOLO
+
+# numpy < 2.0 không có np.pow (chapter3.py / chapter4.py dùng np.pow)
+if not hasattr(np, "pow"):
+    np.pow = np.power
+
+# 3 file chương của bạn (đặt cạnh app.py). Nếu thiếu thì chỉ mục "Thị giác máy" báo lỗi, app vẫn chạy.
+try:
+    import chapter3 as ch3
+    import chapter4 as ch4
+    import Chap9 as ch9
+    CHAPTER_IMPORT_ERROR = None
+except Exception as _e:
+    ch3 = ch4 = ch9 = None
+    CHAPTER_IMPORT_ERROR = _e
+
+st.set_page_config(
+    page_title="Computer Vision Lab",
+    page_icon="👁️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------- Global CSS ----------
+st.markdown("""
+<style>
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+.cv-card {
+    padding: 1rem;
+    border: 1px solid rgba(128,128,128,.25);
+    border-radius: 12px;
+    margin-bottom: 1rem;
+}
+.small-muted {color: #777; font-size: .9rem;}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Session state ----------
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "face_names" not in st.session_state:
+    st.session_state.face_names = []
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+
+# ---------- Helpers ----------
+def add_history(task, result):
+    st.session_state.history.append({
+        "Thời gian": datetime.now().strftime("%H:%M:%S"),
+        "Chức năng": task,
+        "Kết quả": result,
+    })
+
+def image_to_bytes(img):
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def show_input_image(uploaded, camera):
+    if uploaded is not None:
+        return Image.open(uploaded).convert("RGB"), "File upload"
+    if camera is not None:
+        return Image.open(camera).convert("RGB"), "Camera"
+    return None, None
+
+# ---------- Shape (giữ nguyên thuật toán code gốc: tách nền + Hu moments) ----------
+SHAPE_RANGES = {
+    "circle":   (0.000623, 0.000625),
+    "square":   (0.000646, 0.000655),
+    "triangle": (0.00073,  0.00076),
+}
+
+def phan_nguong(imgin, tol=0):
+    """Giống code gốc: pixel trùng màu nền (pixel [0,0]) -> 0, còn lại -> 255.
+    Viết bằng numpy nên nhanh hơn vòng for, kết quả giống hệt khi tol = 0."""
+    mau_nen = imgin[0, 0].astype(np.int16)
+    diff = np.abs(imgin.astype(np.int16) - mau_nen).max(axis=2)
+    return np.where(diff > tol, 255, 0).astype(np.uint8)
+
+def nhan_dang_shape(imgout, ranges):
+    """Moments -> Hu moments -> so Hu[0] với các khoảng ngưỡng (như code gốc)."""
+    Hu = cv2.HuMoments(cv2.moments(imgout))
+    h0 = float(Hu[0][0])
+    for name, (lo, hi) in ranges.items():
+        if lo < h0 < hi:
+            return name, h0
+    return "unknown", h0
+
+# ---------- YOLO26n pretrained (giữ nguyên logic vẽ từ predict.py) ----------
+YOLO_PRETRAINED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "yolo26n.pt")
+
+@st.cache_resource
+def load_yolo_pretrained():
+    try:
+        from ultralytics import YOLO
+        return True, YOLO(YOLO_PRETRAINED_PATH)
+    except Exception as e:
+        return False, str(e)
+
+def yolo_predict_and_draw(model, imgin, conf=0.25):
+    """Giống predict.py: lấy xyxy + tên lớp, vẽ rectangle/putText màu xanh lá.
+    Khác: nhận ảnh sẵn (BGR numpy) thay vì đọc từ file, và có ngưỡng conf."""
+    results = model(imgin, conf=conf, verbose=False)
+    out = imgin.copy()
+    data_names, confs = [], []
+    for result in results:
+        xyxy = result.boxes.xyxy
+        names = [result.names[cls.item()] for cls in result.boxes.cls.int()]
+        confs_t = result.boxes.conf
+
+        dataxy = xyxy.data.tolist()
+        data_names = list(names)
+        confs = confs_t.tolist()
+        for i in range(len(dataxy)):
+            obj1 = dataxy[i]
+            pt1 = (int(obj1[0]), int(obj1[1]))
+            pt2 = (int(obj1[2]), int(obj1[3]))
+            cv2.rectangle(out, pt1, pt2, (0, 255, 0), 1)
+            label = f"{data_names[i]} {confs[i]:.2f}"
+            cv2.putText(out, label, (int(obj1[0]) - 10, int(obj1[1]) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return out, data_names, confs
+
+# ---------- YOLO26n (dùng file .pt do bạn train / tải, không hard-code model có sẵn) ----------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def find_model_file(filename):
+    """Tìm model cạnh app.py hoặc trong thư mục models/, để chạy được dù đặt project ở đâu
+    (vd D:\\ThiGIacMay\\streamlit_thi_giac_may_v2\\yolo26n.pt hay .../models/yolo26n.pt)."""
+    for candidate in (
+        os.path.join(BASE_DIR, filename),
+        os.path.join(BASE_DIR, "models", filename),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+@st.cache_resource
+def load_yolo(filename):
+    path = find_model_file(filename)
+    if path is None:
+        return None, filename
+    return YOLO(path), path
+
+def yolo_predict_and_draw(model, img_rgb, conf):
+    """Giống hệt luồng trong predict.py: lấy xyxy + tên lớp, vẽ rectangle/putText bằng cv2."""
+    imgin = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
+    results = model(imgin, conf=conf, verbose=False)
+    result = results[0]
+
+    xyxy = result.boxes.xyxy
+    names = [result.names[cls.item()] for cls in result.boxes.cls.int()]
+    confs = result.boxes.conf
+
+    dataxy = xyxy.data.tolist()
+    data_names = list(names)
+    data_confs = confs.tolist()
+
+    for i in range(len(dataxy)):
+        obj1 = dataxy[i]
+        pt1 = (int(obj1[0]), int(obj1[1]))
+        pt2 = (int(obj1[2]), int(obj1[3]))
+        cv2.rectangle(imgin, pt1, pt2, (0, 255, 0), 1)
+        cv2.putText(imgin, data_names[i], (int(obj1[0]) - 10, int(obj1[1]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    out_rgb = cv2.cvtColor(imgin, cv2.COLOR_BGR2RGB)
+    table = [{"Lớp": n, "Confidence": round(float(c), 3)} for n, c in zip(data_names, data_confs)]
+    return out_rgb, table
+
+# ---------- Nhận dạng khuôn mặt: YuNet (detect) + SFace (đặc trưng 128-d) + SVC (phân loại) ----------
+FACE_NAMES = ["Khoa", "Kien", "Nghia", "Tin"]  # đúng thứ tự nhãn 0,1,2,3 của svc.pkl (như predict.py gốc)
+
+def find_first_model(*filenames):
+    for fn in filenames:
+        path = find_model_file(fn)
+        if path:
+            return path
+    return None
+
+@st.cache_resource
+def load_face_models():
+    """Trả về ((detector, recognizer, svc), []) hoặc (None, [tên file còn thiếu])."""
+    det_path = find_first_model("face_detection_yunet_2023mar.onnx")
+    rec_path = find_first_model("face_recognition_sface_2021dec.onnx",
+                                "face_recognition_sface_2021dec_1.onnx")
+    svc_path = find_first_model("svc.pkl")
+    missing = [name for name, path in [
+        ("face_detection_yunet_2023mar.onnx", det_path),
+        ("face_recognition_sface_2021dec.onnx", rec_path),
+        ("svc.pkl", svc_path),
+    ] if path is None]
+    if missing:
+        return None, missing
+    detector = cv2.FaceDetectorYN.create(det_path, "", (320, 320), 0.9, 0.3, 5000)
+    recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
+    svc = joblib.load(svc_path)
+    return (detector, recognizer, svc), []
+
+def recognize_faces(frame, models, score_thr=0.9, unknown_thr=0.5, max_faces=5,
+                    show_box=True, show_conf=True, show_landmarks=False):
+    """Nhận dạng tất cả khuôn mặt trong 1 khung hình BGR (ảnh / khung video / webcam).
+    Luồng giống predict.py gốc: detect -> alignCrop -> feature -> SVC.
+    Khác: dùng điểm lớn nhất của decision_function làm độ tin cậy (bản gốc so sánh cả mảng
+    nên sẽ báo lỗi với SVC 4 lớp)."""
+    detector, recognizer, svc = models
+    h, w = frame.shape[:2]
+    detector.setInputSize((w, h))
+    detector.setScoreThreshold(float(score_thr))
+    _, faces = detector.detect(frame)
+
+    out = frame.copy()
+    results = []
+    if faces is None:
+        return out, results
+
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:int(max_faces)]
+    for face in faces:
+        feat = recognizer.feature(recognizer.alignCrop(frame, face))
+        scores = svc.decision_function(feat)[0]
+        best = int(np.argmax(scores))
+        conf = float(scores[best])
+        label_id = int(svc.classes_[best])
+        if conf < unknown_thr or label_id >= len(FACE_NAMES):
+            name, color = "unknown", (0, 0, 255)
+        else:
+            name, color = FACE_NAMES[label_id], (0, 255, 0)
+
+        x, y, bw, bh = face[:4].astype(np.int32)
+        if show_box:
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 2)
+        if show_landmarks:
+            lm = face[4:14].astype(np.int32)
+            for k, c in enumerate([(255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 0, 255), (0, 255, 255)]):
+                cv2.circle(out, (int(lm[2 * k]), int(lm[2 * k + 1])), 2, c, 2)
+        label = f"{name} ({conf:.2f})" if show_conf else name
+        cv2.putText(out, label, (int(x), max(int(y) - 10, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        results.append({"Tên": name, "Điểm SVC": round(conf, 3),
+                        "Điểm phát hiện": round(float(face[-1]), 2)})
+    return out, results
+
+def process_face_video(video_path, models, params, sample_every=2, max_frames=150,
+                       max_width=640, save_output=True, on_frame=None):
+    """Nhận dạng khuôn mặt trên file video. Trả về dict thống kê (+ đường dẫn video kết quả)."""
+    cap = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    writer, out_path = None, None
+    counts = Counter()
+    processed, frame_idx, frames_with_faces = 0, 0, 0
+    while processed < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_idx % sample_every == 0:
+            fh, fw = frame.shape[:2]
+            if fw > max_width:
+                frame = cv2.resize(frame, (max_width, int(fh * max_width / fw)))
+            annotated, results = recognize_faces(frame, models, **params)
+            names = {r["Tên"] for r in results}
+            counts.update(names)
+            frames_with_faces += 1 if results else 0
+            if save_output:
+                if writer is None:
+                    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                    writer = cv2.VideoWriter(
+                        out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                        max(1.0, src_fps / sample_every),
+                        (annotated.shape[1], annotated.shape[0]))
+                writer.write(annotated)
+            processed += 1
+            if on_frame:
+                on_frame(annotated, processed, frame_idx, total, results)
+        frame_idx += 1
+    cap.release()
+    if writer is not None:
+        writer.release()
+    return {"counts": counts, "processed": processed, "frames_read": frame_idx,
+            "frames_with_faces": frames_with_faces, "out_path": out_path}
+
+def to_browser_mp4(src_path):
+    """mp4v (OpenCV) thường không phát được trên trình duyệt -> chuyển sang H.264 nếu có ffmpeg."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not src_path:
+        return src_path, False
+    dst = src_path.replace(".mp4", "_h264.mp4")
+    r = subprocess.run([ffmpeg, "-y", "-i", src_path, "-vcodec", "libx264",
+                        "-pix_fmt", "yuv420p", dst], capture_output=True)
+    if r.returncode == 0 and os.path.exists(dst):
+        return dst, True
+    return src_path, False
+
+# ---------- Nội dung mở rộng 2: phân loại bệnh về mắt (EfficientNetB5, Keras, train trên Kaggle) ----------
+EYE_MODEL_FILE = "best_eye_model_b5.keras"
+EYE_IMG_SIZE = (456, 456)
+EYE_CLASSES = ["cataract", "diabetic_retinopathy", "glaucoma", "normal"]  # thứ tự alphabet như lúc train
+EYE_VI = {
+    "cataract": "Đục thủy tinh thể (Cataract)",
+    "diabetic_retinopathy": "Bệnh võng mạc tiểu đường",
+    "glaucoma": "Tăng nhãn áp (Glaucoma)",
+    "normal": "Bình thường",
+}
+
+@st.cache_resource
+def load_eye_model(path):
+    """Import tensorflow trễ để các mục khác của app khởi động nhanh."""
+    import tensorflow as tf
+    return tf.keras.models.load_model(path, compile=False)
+
+def predict_eye(model, img_pil, threshold=30.0, diabetic_limit=0.3):
+    """Giống predict_medical_precision trong notebook Kaggle.
+    Ảnh giữ thang 0-255 (EfficientNet có sẵn bước chuẩn hoá bên trong model)."""
+    arr = np.asarray(img_pil.convert("RGB").resize(EYE_IMG_SIZE, Image.BILINEAR), dtype=np.float32)
+    probs = model.predict(np.expand_dims(arr, 0), verbose=0)[0]
+
+    max_idx = int(np.argmax(probs))
+    confidence = float(probs[max_idx]) * 100
+    predicted = EYE_CLASSES[max_idx]
+    prob_diabetic = float(probs[EYE_CLASSES.index("diabetic_retinopathy")])
+
+    if prob_diabetic > diabetic_limit and predicted != "diabetic_retinopathy":
+        status, text, conf = "warning", "Nghi ngờ bệnh võng mạc tiểu đường", prob_diabetic * 100
+    elif confidence < threshold:
+        status, text, conf = "uncertain", "Cần kiểm tra lại", confidence
+    else:
+        status, text, conf = "normal", EYE_VI[predicted], confidence
+    return {"status": status, "text": text, "conf": conf, "top": predicted, "probs": probs}
+
+# ---------- Thị giác máy: Chương 3, 4, 9 (dùng code trong chapter3.py, chapter4.py, Chap9.py) ----------
+def _box_filter(imgin):      # giống menu BoxFilter trong thigiacmay.py
+    return cv2.boxFilter(imgin, cv2.CV_8U, (21, 21))
+
+def _gauss_filter(imgin):    # giống menu GaussFilter
+    return cv2.GaussianBlur(imgin, (43, 43), 7.0)
+
+def _median_filter(imgin):   # giống menu Medianfilter
+    return cv2.medianBlur(imgin, 7)
+
+def build_chapter_registry():
+    """Bảng tra: chương -> chức năng -> hàm xử lý. slow: 0 nhanh, 1 chậm, 2 rất chậm (vòng lặp Python)."""
+    if CHAPTER_IMPORT_ERROR is not None:
+        return None
+
+    def e(fn, desc, color=False, slow=0, note="", count=False):
+        return dict(fn=fn, desc=desc, color=color, slow=slow, note=note, count=count)
+
+    return {
+        "Chương 3": {
+            "Negative": e(ch3.Negative, "Âm bản ảnh xám: s = L-1-r.", slow=1),
+            "Negative Color": e(ch3.NegativeColor, "Âm bản ảnh màu, xử lý từng điểm ảnh.", color=True, slow=1),
+            "Negative Color 2": e(ch3.NegativeColor2, "Âm bản ảnh màu bằng cách tách 3 kênh B, G, R.", color=True, slow=1),
+            "Logarit": e(ch3.Logarit, "Biến đổi logarit: s = c·log(1+r).", slow=1),
+            "Logarit Color": e(ch3.LogaritColor, "Biến đổi logarit cho ảnh màu.", color=True, slow=1),
+            "Power": e(ch3.Power, "Biến đổi luỹ thừa (gamma = 5.0).", slow=1),
+            "Piecewise Linear": e(ch3.PiwiseLinear, "Cắt lớp cường độ: điểm ảnh trong khoảng (146, 235) đặt thành 255, còn lại giữ nguyên.", slow=1),
+            "Histogram": e(ch3.Histogram, "Vẽ histogram của ảnh xám.", slow=1),
+            "Histogram Equalization": e(ch3.HitsEqual, "Cân bằng histogram (tự cài đặt).", slow=1),
+            "Local Histogram Equalization": e(ch3.LocalHitsEqual, "Cân bằng histogram cục bộ, cửa sổ 3x3.", slow=2),
+            "HisStat": e(ch3.HisStat, "Tăng cường ảnh dựa trên thống kê histogram cục bộ.", slow=2),
+            "Box Filter": e(_box_filter, "Lọc trung bình 21x21 (cv2.boxFilter)."),
+            "Gauss Filter": e(_gauss_filter, "Lọc Gauss 43x43, sigma = 7 (cv2.GaussianBlur)."),
+            "Median Filter": e(_median_filter, "Lọc trung vị 7x7 (cv2.medianBlur)."),
+            "Sharp": e(ch3.Sharp, "Làm sắc nét bằng toán tử Laplacian."),
+            "Gradient": e(ch3.Gradient, "Gradient Sobel: |gx| + |gy|."),
+        },
+        "Chương 4": {
+            "Spectrum": e(ch4.Spectrum, "Phổ biên độ của ảnh (DFT, đưa tâm về giữa).", note="Phổ thường rất tối vì chưa lấy log; đúng như bản tkinter của bạn."),
+            "Ideal Lowpass": e(ch4.IdealLowpassFrequencyFiltering, "Lọc thông thấp lý tưởng trong miền tần số, D0 = 60.", slow=1),
+            "Gauss Lowpass": e(ch4.GaussLowpassFrequencyFiltering, "Lọc thông thấp Gauss trong miền tần số, D0 = 60.", slow=1),
+            "Butterworth Highpass": e(ch4.ButterworthHighpassFrequencyFilter, "Lọc thông cao Butterworth, D0 = 30, n = 2.", slow=1),
+            "Draw Notch Reject": e(ch4.DrawNotchrejectFilter, "Vẽ bộ lọc notch reject (4 cặp điểm đối xứng, D0 = 10).", slow=2,
+                                   note="Toạ độ các điểm notch được cố định theo ảnh mẫu của bài."),
+            "Vertical Notch Reject": e(ch4.VertaicalNotFrequencyFiltering, "Lọc loại bỏ nhiễu dạng sọc dọc trong miền tần số.", slow=1),
+        },
+        "Chương 9": {
+            "Erosion": e(ch9.Erosion, "Co ảnh (erosion) với phần tử cấu trúc vuông 45x45."),
+            "Dilation": e(ch9.Dilation, "Giãn ảnh (dilation) với phần tử cấu trúc vuông 2x2."),
+            "Boundary": e(ch9.Boundary, "Trích biên: ảnh trừ ảnh sau erosion 3x3."),
+            "Contours": e(ch9.Contours, "Vẽ đường bao đầu tiên tìm được (màu đỏ).",
+                          note="Cần ảnh nhị phân, vật thể trắng trên nền đen. Có thể bật 'Nhị phân hoá' trong tuỳ chọn."),
+            "Hole Fill": e(ch9.Holefill, "Lấp lỗ bằng floodFill từ một điểm bên trong.",
+                           note="Điểm mồi cố định (105, 298) theo ảnh mẫu của bài; ảnh nhỏ hơn sẽ báo lỗi."),
+            "Convex Hull": e(ch9.ConvexHull, "Vẽ đường bao (đỏ) và bao lồi (xanh) của vật thể.",
+                             note="Cần ảnh nhị phân, vật thể trắng trên nền đen (ảnh bàn tay)."),
+            "Convexity Defect Detect": e(ch9.ConvexityDefectDetect, "Phát hiện chỗ lõm của bao lồi (độ sâu > 1000).",
+                                         note="Cần ảnh bàn tay nhị phân; vật thể lồi hoàn toàn sẽ báo lỗi vì không có chỗ lõm."),
+            "Connected Components": e(ch9.ConnectedComponents, "Ngưỡng 200, lọc trung vị rồi đếm các thành phần liên thông.", slow=1, count=True),
+            "Count Rice": e(ch9.CountRice, "Đếm hạt gạo: top-hat, nhị phân, lọc trung vị, bỏ hạt nhỏ hơn 50% hạt lớn nhất.", slow=1, count=True),
+        },
+    }
+
+def run_chapter_function(entry, img_bgr, binarize=False, invert=False):
+    """Chạy 1 chức năng của chương. Ảnh màu hoặc ảnh xám tuỳ hàm (giống thigiacmay.py)."""
+    if entry["color"]:
+        src = img_bgr.copy()
+    else:
+        src = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        if binarize:
+            flag = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+            _, src = cv2.threshold(src, 0, 255, flag + cv2.THRESH_OTSU)
+
+    buf = io.StringIO()
+    t0 = time.perf_counter()
+    with contextlib.redirect_stdout(buf):      # gom các lệnh print() trong code chương
+        out = entry["fn"](src.copy())
+    elapsed = time.perf_counter() - t0
+
+    n_comp = None
+    if entry["count"]:
+        o = np.asarray(out)
+        if o.ndim == 3:
+            o = cv2.cvtColor(o.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        n_comp = int(cv2.connectedComponents((o > 0).astype(np.uint8))[0] - 1)
+    return {"src": src, "out": out, "elapsed": elapsed, "log": buf.getvalue(), "count": n_comp}
+
+def mv_to_uint8(arr):
+    arr = np.asarray(arr)
+    return arr if arr.dtype == np.uint8 else np.clip(arr, 0, 255).astype(np.uint8)
+
+def mv_show(arr, caption):
+    """Hiển thị ảnh BGR hoặc xám."""
+    arr = mv_to_uint8(arr)
+    st.image(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if arr.ndim == 3 else arr,
+             caption=caption, use_container_width=True, clamp=True)
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.title("👁️ Computer Vision")
+    st.caption("Streamlit • Localhost")
+    st.divider()
+
+    menu = st.radio(
+        "Chọn chức năng",
+        [
+            "🏠 Trang chủ",
+            "👤 Nhận dạng khuôn mặt",
+            "🎯 Nhận dạng đối tượng YOLO",
+            "🔺 Nhận dạng shape",
+            "🍎 Nhận dạng 5 loại trái cây",
+            "📚 Thị giác máy",
+            "🚀 Nội dung mở rộng",
+            "⚙️ Cài đặt",
+        ],
+    )
+
+    st.divider()
+    st.subheader("👤 Thông tin cá nhân")
+
+    ten = st.text_input(
+        "Họ và tên",
+        value="Nguyễn Minh Nghĩa",
+        key="student_name",
+    )
+
+    mssv = st.text_input(
+        "MSSV",
+        value="",
+        placeholder="23134039",
+        key="student_id",
+    )
+
+    mon_hoc = st.text_input(
+        "Tên môn học",
+        value="Thị giác máy",
+        disabled=True,
+        key="course_name",
+    )
+
+    st.caption("Thông tin này được dùng để hiển thị trên giao diện project.")
+
+    st.divider()
+    st.write("**Trạng thái hệ thống**")
+    st.success("App đang chạy")
+    st.caption("Model sẽ được gắn vào sau khi bạn gửi code từng phần.")
+
+# =========================================================
+# HOME
+# =========================================================
+if menu == "🏠 Trang chủ":
+    st.title("👁️ Ứng dụng Thị giác máy")
+    st.subheader("Computer Vision Project")
+
+    st.markdown("### 👤 Thông tin cá nhân")
+    info1, info2, info3 = st.columns(3)
+    with info1:
+        st.write("**Họ và tên**")
+        st.write(st.session_state.get("student_name", "Nguyễn Minh Nghĩa"))
+    with info2:
+        st.write("**MSSV**")
+        st.write(st.session_state.get("student_id") or "Chưa nhập MSSV")
+    with info3:
+        st.write("**Môn học**")
+        st.write("Thị giác máy")
+
+    st.divider()
+
+    st.info(
+        "Đây là bộ khung Streamlit để tích hợp lần lượt các bài: "
+        "nhận dạng khuôn mặt, YOLO, shape, 5 loại trái cây và các nội dung "
+        "thị giác máy khác."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Module", "5+")
+    with c2:
+        st.metric("Nền tảng", "Streamlit")
+    with c3:
+        st.metric("Chạy", "Localhost")
+
+    st.divider()
+    st.subheader("Các chức năng")
+
+    data = pd.DataFrame({
+        "STT": [1, 2, 3, 4, 5],
+        "Chức năng": [
+            "Nhận dạng khuôn mặt tối đa 5 bạn",
+            "Nhận dạng đối tượng YOLO26n",
+            "Nhận dạng shape",
+            "Nhận dạng 5 loại trái cây",
+            "Thị giác máy chương 3, 4, 9",
+        ],
+        "Model": [
+            "YuNet + SFace + SVC",
+            "yolo26n.pt",
+            "Hu moments",
+            "best.pt",
+            "OpenCV + NumPy",
+        ],
+        "Trạng thái": ["Đã tích hợp", "Đã tích hợp", "Đã tích hợp", "Đã tích hợp", "Đã tích hợp"],
+    })
+    st.dataframe(data, use_container_width=True, hide_index=True)
+
+    with st.expander("📌 Quy trình tích hợp"):
+        st.markdown("""
+        1. Giữ nguyên giao diện Streamlit này.
+        2. Gửi code từng chức năng.
+        3. Chuyển code xử lý thành hàm/module.
+        4. Gắn model vào đúng module.
+        5. Kiểm tra input → inference → output.
+        6. Hoàn thiện giao diện và lịch sử kết quả.
+        """)
+
+# =========================================================
+# FACE
+# =========================================================
+elif menu == "👤 Nhận dạng khuôn mặt":
+    st.title("👤 Nhận dạng khuôn mặt")
+    st.caption("Tối đa 5 người trong một khung hình • YuNet + SFace (ONNX) + SVC • Ảnh / Video / Webcam")
+
+    face_models, face_missing = load_face_models()
+    if face_models is None:
+        st.error(
+            "Thiếu file model: " + ", ".join(f"`{m}`" for m in face_missing) +
+            ". Đặt cạnh `app.py` hoặc trong thư mục `models/`."
+        )
+    else:
+        st.caption("Người đã học: " + ", ".join(FACE_NAMES))
+
+        with st.expander("⚙️ Cấu hình"):
+            col1, col2 = st.columns(2)
+            with col1:
+                max_faces = st.number_input("Số người tối đa", 1, 5, 5, key="face_max")
+                show_box = st.checkbox("Hiển thị bounding box", True, key="face_box")
+                show_landmarks = st.checkbox("Hiển thị 5 điểm landmark", False, key="face_lm")
+            with col2:
+                unknown_thr = st.slider("Ngưỡng nhận dạng (dưới ngưỡng = unknown)", 0.0, 1.5, 0.50, 0.01,
+                                        key="face_unknown_thr",
+                                        help="So với điểm cao nhất của SVC (decision_function).")
+                det_thr = st.slider("Ngưỡng phát hiện khuôn mặt (YuNet)", 0.1, 1.0, 0.90, 0.05,
+                                    key="face_det_thr")
+                show_conf = st.checkbox("Hiển thị độ tin cậy", True, key="face_conf")
+
+        face_params = dict(score_thr=det_thr, unknown_thr=unknown_thr, max_faces=max_faces,
+                           show_box=show_box, show_conf=show_conf, show_landmarks=show_landmarks)
+
+        mode = st.radio("Nguồn dữ liệu",
+                        ["📁 Upload ảnh", "📷 Chụp ảnh", "🎬 Video (file)", "🔴 Webcam realtime"],
+                        horizontal=True, key="face_mode")
+
+        # ---------- Ảnh (upload / chụp) ----------
+        if mode in ("📁 Upload ảnh", "📷 Chụp ảnh"):
+            if mode == "📁 Upload ảnh":
+                src = st.file_uploader("Chọn ảnh", type=["jpg", "jpeg", "png", "bmp"], key="face_upload")
+            else:
+                src = st.camera_input("Chụp ảnh", key="face_camera")
+
+            if src is not None:
+                img = Image.open(src).convert("RGB")
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+
+                if st.button("🔍 Nhận dạng khuôn mặt", type="primary"):
+                    out, results = recognize_faces(frame, face_models, **face_params)
+                    st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB),
+                             caption=f"Phát hiện {len(results)} khuôn mặt", use_container_width=True)
+                    if results:
+                        st.dataframe(pd.DataFrame(results).assign(STT=range(1, len(results) + 1))
+                                     [["STT", "Tên", "Điểm SVC", "Điểm phát hiện"]],
+                                     use_container_width=True, hide_index=True)
+                        add_history("Nhận dạng khuôn mặt", ", ".join(r["Tên"] for r in results))
+                    else:
+                        st.info("Không phát hiện khuôn mặt nào.")
+                        add_history("Nhận dạng khuôn mặt", "Không có khuôn mặt")
+
+        # ---------- Video (file) ----------
+        elif mode == "🎬 Video (file)":
+            uploaded_video = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"],
+                                              key="face_video_upload")
+            c1, c2, c3 = st.columns(3)
+            sample_every = c1.slider("Xử lý 1 khung mỗi N khung", 1, 15, 2, key="face_sample_every",
+                                     help="Tăng N để chạy nhanh hơn.")
+            max_frames = c2.slider("Số khung tối đa xử lý", 10, 1000, 150, 10, key="face_max_frames")
+            max_width = c3.slider("Chiều rộng tối đa (px)", 320, 1280, 640, 80, key="face_max_width",
+                                  help="Khung lớn hơn sẽ được thu nhỏ để chạy nhanh hơn.")
+            save_output = st.checkbox("Tạo video kết quả để xem/tải về", True, key="face_save_video")
+
+            if uploaded_video is not None and st.button("🎬 Nhận dạng video", type="primary"):
+                tfile = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=os.path.splitext(uploaded_video.name)[1])
+                tfile.write(uploaded_video.read())
+                tfile.close()
+
+                progress = st.progress(0.0)
+                preview = st.empty()
+
+                def on_frame(annotated, processed, frame_idx, total, results):
+                    progress.progress(min(1.0, processed / max_frames))
+                    preview.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                                  caption=f"Khung #{frame_idx} • {', '.join(r['Tên'] for r in results) or 'không có mặt'}",
+                                  use_container_width=True)
+
+                stats = process_face_video(tfile.name, face_models, face_params, sample_every,
+                                           max_frames, max_width, save_output, on_frame)
+                os.unlink(tfile.name)
+                preview.empty()
+                progress.empty()
+
+                video_bytes, playable = None, False
+                if stats["out_path"]:
+                    final_path, playable = to_browser_mp4(stats["out_path"])
+                    with open(final_path, "rb") as f:
+                        video_bytes = f.read()
+                st.session_state.face_video_result = {**stats, "video_bytes": video_bytes, "playable": playable}
+                add_history("Nhận dạng khuôn mặt (video)",
+                            f"{stats['processed']} khung — " +
+                            (", ".join(f"{k}: {v}" for k, v in stats["counts"].items()) or "không có mặt"))
+
+            res = st.session_state.get("face_video_result")
+            if res:
+                st.subheader(f"Đã xử lý {res['processed']} khung (đã đọc {res['frames_read']} khung)")
+                if res["counts"]:
+                    st.write("Số khung hình mà từng người xuất hiện:")
+                    st.bar_chart(dict(res["counts"]))
+                    st.dataframe([{"Tên": k, "Số khung nhận ra": v} for k, v in res["counts"].items()],
+                                 use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Không phát hiện khuôn mặt nào trong video.")
+                if res["video_bytes"]:
+                    if res["playable"]:
+                        st.video(res["video_bytes"])
+                    else:
+                        st.caption("Máy chưa có ffmpeg nên không phát trực tiếp được trên trình duyệt — hãy tải video về xem.")
+                    st.download_button("⬇️ Tải video kết quả", data=res["video_bytes"],
+                                       file_name="face_result.mp4", mime="video/mp4")
+
+        # ---------- Webcam realtime (chạy trên máy đang mở app) ----------
+        else:
+            st.caption("Dùng webcam của chính máy đang chạy Streamlit (localhost). "
+                       "Bỏ tích ô bên dưới để dừng.")
+            cam_index = st.number_input("Chỉ số camera", 0, 5, 0, key="face_cam_index")
+            run = st.checkbox("▶️ Bật webcam", key="face_cam_run")
+            frame_slot = st.empty()
+            info_slot = st.empty()
+
+            if run:
+                cap = cv2.VideoCapture(int(cam_index))
+                if not cap.isOpened():
+                    st.error("Không mở được webcam. Kiểm tra chỉ số camera hoặc quyền truy cập camera.")
+                else:
+                    try:
+                        tm = cv2.TickMeter()
+                        while True:
+                            ok, frame = cap.read()
+                            if not ok:
+                                st.warning("Không đọc được khung hình từ webcam.")
+                                break
+                            tm.reset()
+                            tm.start()
+                            out, results = recognize_faces(frame, face_models, **face_params)
+                            tm.stop()
+                            cv2.putText(out, f"FPS: {tm.getFPS():.1f}", (5, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            frame_slot.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
+                            info_slot.write("Đang thấy: " + (", ".join(r["Tên"] for r in results) or "—"))
+                    finally:
+                        cap.release()
+
+# =========================================================
+# YOLO
+# =========================================================
+elif menu == "🎯 Nhận dạng đối tượng YOLO":
+    st.title("🎯 Nhận dạng đối tượng")
+    st.caption("YOLO26n • yolo26n.pt")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        mode = st.selectbox("Chế độ", ["Ảnh", "Camera"], key="yolo_mode")
+    with col2:
+        conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01, key="yolo_conf")
+
+    model, model_path = load_yolo("yolo26n.pt")
+    if model is None:
+        st.error(
+            "Không tìm thấy `yolo26n.pt`. Đặt file này cạnh `app.py`, "
+            "hoặc trong thư mục `models/yolo26n.pt`."
+        )
+    else:
+        st.caption(f"Đang dùng model: `{model_path}`")
+
+        if mode == "Ảnh":
+            uploaded = st.file_uploader(
+                "Upload ảnh để nhận dạng",
+                type=["jpg", "jpeg", "png", "bmp"],
+                key="yolo_upload",
+            )
+            img = Image.open(uploaded).convert("RGB") if uploaded is not None else None
+        else:
+            camera = st.camera_input("Chụp ảnh", key="yolo_camera")
+            img = Image.open(camera).convert("RGB") if camera is not None else None
+
+        if img is not None:
+            st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+
+            if st.button("🚀 Chạy YOLO", type="primary"):
+                out_rgb, table = yolo_predict_and_draw(model, img, conf)
+                st.image(out_rgb, caption=f"Phát hiện {len(table)} đối tượng", use_container_width=True)
+                if table:
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                    add_history("YOLO", f"{len(table)} đối tượng: " +
+                               ", ".join(sorted({r['Lớp'] for r in table})))
+                else:
+                    st.info("Không phát hiện đối tượng nào với ngưỡng confidence hiện tại.")
+                    add_history("YOLO", "0 đối tượng")
+
+# =========================================================
+# SHAPE
+# =========================================================
+elif menu == "🔺 Nhận dạng shape":
+    st.title("🔺 Nhận dạng hình học")
+    st.caption("Tam giác • Hình vuông • Hình tròn • Tách nền + Hu moments")
+
+    with st.expander("⚙️ Ngưỡng Hu[0] và dung sai nền", expanded=False):
+        st.caption("Mặc định giữ đúng ngưỡng của code gốc. Nếu kết quả là unknown, "
+                   "xem giá trị Hu[0] hiển thị bên dưới rồi chỉnh lại khoảng cho phù hợp.")
+        ranges = {}
+        cols = st.columns(3)
+        labels = {"circle": "Tròn (circle)", "square": "Vuông (square)", "triangle": "Tam giác (triangle)"}
+        for col, (name, (lo0, hi0)) in zip(cols, SHAPE_RANGES.items()):
+            with col:
+                st.write(f"**{labels[name]}**")
+                lo = st.number_input("Từ", value=lo0, step=0.000001, format="%.6f", key=f"shape_lo_{name}")
+                hi = st.number_input("Đến", value=hi0, step=0.000001, format="%.6f", key=f"shape_hi_{name}")
+                ranges[name] = (lo, hi)
+        tol = st.slider("Dung sai màu nền (0 = giống code gốc, so khớp tuyệt đối)", 0, 60, 0,
+                        help="Ảnh JPG hay bị nhiễu màu nền. Tăng nhẹ nếu ảnh nền không sạch.")
+
+    uploaded = st.file_uploader(
+        "Upload ảnh (nền đồng màu, một hình)",
+        type=["jpg", "jpeg", "png", "bmp"],
+        key="shape_upload",
+    )
+
+    if uploaded is not None:
+        img = Image.open(uploaded).convert("RGB")
+        imgin = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        if st.button("🔎 Nhận dạng shape", type="primary"):
+            imgout = phan_nguong(imgin, tol)
+            result, h0 = nhan_dang_shape(imgout, ranges)
+
+            annotated = imgin.copy()
+            scale = max(0.8, min(annotated.shape[:2]) / 400)
+            cv2.putText(annotated, result, (int(15 * scale), int(45 * scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), max(2, int(2 * scale)))
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+            with c2:
+                st.image(imgout, caption="Sau phân ngưỡng (tách nền)", use_container_width=True)
+            with c3:
+                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                         caption="Kết quả", use_container_width=True)
+
+            m1, m2 = st.columns(2)
+            m1.metric("Kết quả", result)
+            m2.metric("Hu[0]", f"{h0:.6f}")
+
+            if result == "unknown":
+                st.warning("Hu[0] không nằm trong khoảng nào. Kiểm tra ảnh nhị phân hoặc chỉnh ngưỡng ở phần cấu hình.")
+            else:
+                st.success(f"Đây là hình: {result}")
+
+            add_history("Shape", f"{result} (Hu[0]={h0:.6f})")
+        else:
+            st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+
+# =========================================================
+# FRUIT
+# =========================================================
+elif menu == "🍎 Nhận dạng 5 loại trái cây":
+    st.title("🍎 Nhận dạng 5 loại trái cây")
+    st.caption("YOLO26n tự train • best.pt")
+
+    st.info(
+        "Không tạo dataset 5 loại hoàn toàn mới. Hai lớp bổ sung phải được "
+        "thêm vào dataset trái cây hiện có theo yêu cầu bài."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**Dataset / Training**")
+        st.checkbox("Sử dụng dataset trái cây hiện có", True, key="fruit_use_dataset")
+        st.checkbox("Đã thêm 2 class mới", True, key="fruit_added_classes")
+    with col2:
+        st.write("**Inference**")
+        fruit_conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01, key="fruit_conf")
+
+    fruit_model, fruit_model_path = load_yolo("best.pt")
+    if fruit_model is None:
+        st.error(
+            "Không tìm thấy `best.pt`. Đặt file này cạnh `app.py`, "
+            "hoặc trong thư mục `models/best.pt`."
+        )
+    else:
+        st.caption(f"Đang dùng model: `{fruit_model_path}` • Các lớp: " + ", ".join(fruit_model.names.values()))
+
+        uploaded = st.file_uploader(
+            "Upload ảnh trái cây",
+            type=["jpg", "jpeg", "png", "bmp"],
+            key="fruit_upload",
+        )
+
+        if uploaded is not None:
+            img = Image.open(uploaded).convert("RGB")
+            st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+
+            if st.button("🍎 Nhận dạng trái cây", type="primary"):
+                out_rgb, table = yolo_predict_and_draw(fruit_model, img, fruit_conf)
+                st.image(out_rgb, caption=f"Phát hiện {len(table)} đối tượng", use_container_width=True)
+                if table:
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                    add_history("Trái cây", f"{len(table)} đối tượng: " +
+                               ", ".join(sorted({r['Lớp'] for r in table})))
+                else:
+                    st.info("Không phát hiện đối tượng nào với ngưỡng confidence hiện tại.")
+                    add_history("Trái cây", "0 đối tượng")
+
+# =========================================================
+# MACHINE VISION
+# =========================================================
+elif menu == "📚 Thị giác máy":
+    st.title("📚 Thị giác máy")
+    st.caption("Chương 3 • Chương 4 • Chương 9 — dùng chung một giao diện và một ảnh đầu vào")
+
+    registry = build_chapter_registry()
+    if registry is None:
+        st.error(
+            f"Không import được `chapter3.py`, `chapter4.py`, `Chap9.py`: {CHAPTER_IMPORT_ERROR}\n\n"
+            "Đặt 3 file này cạnh `app.py`."
+        )
+    else:
+        col_a, col_b = st.columns([1, 2])
+        chapter = col_a.radio("Chương", list(registry.keys()), key="mv_chapter")
+        funcs = registry[chapter]
+        func_name = col_b.selectbox(
+            "Chức năng", list(funcs.keys()), key=f"mv_func_{chapter}",
+            format_func=lambda k: k + {0: "", 1: "  ⏱", 2: "  ⏱⏱"}[funcs[k]["slow"]],
+        )
+        entry = funcs[func_name]
+        st.info(entry["desc"])
+        if entry["note"]:
+            st.caption("⚠️ " + entry["note"])
+        st.caption("⏱ = xử lý bằng vòng lặp Python nên chậm với ảnh lớn • ⏱⏱ = rất chậm")
+
+        mv_up = st.file_uploader("Upload ảnh", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+                                 key="mv_upload")
+
+        with st.expander("⚙️ Tuỳ chọn ảnh đầu vào"):
+            resize_on = st.checkbox("Thu nhỏ ảnh để chạy nhanh", False, key="mv_resize",
+                                    help="Hàm có toạ độ cố định (Hole Fill, Draw Notch Reject...) nên chạy ở kích thước gốc.")
+            max_side = st.slider("Cạnh dài tối đa (px)", 128, 1024, 512, 32, key="mv_maxside",
+                                 disabled=not resize_on)
+            if chapter == "Chương 9":
+                binarize = st.checkbox("Nhị phân hoá (Otsu) trước khi chạy", False, key="mv_bin")
+                invert = st.checkbox("Đảo nhị phân (vật thể trắng trên nền đen)", False, key="mv_inv",
+                                     disabled=not binarize)
+            else:
+                binarize = invert = False
+
+        if mv_up is not None:
+            pil = Image.open(mv_up).convert("RGB")
+            img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            if resize_on and max(img_bgr.shape[:2]) > max_side:
+                s = max_side / max(img_bgr.shape[:2])
+                img_bgr = cv2.resize(img_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+            h_img, w_img = img_bgr.shape[:2]
+            st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+                     caption=f"Ảnh đầu vào ({w_img}x{h_img})", width=320)
+
+            limit = {1: 400_000, 2: 100_000}.get(entry["slow"])
+            if limit and h_img * w_img > limit:
+                st.warning(f"Ảnh {w_img}x{h_img} khá lớn, hàm này có thể mất khá lâu. "
+                           "Bật 'Thu nhỏ ảnh để chạy nhanh' trong phần tuỳ chọn nếu cần.")
+
+            if st.button("▶️ Chạy", type="primary", key="mv_run"):
+                with st.spinner(f"Đang chạy {func_name}..."):
+                    try:
+                        res = run_chapter_function(entry, img_bgr, binarize, invert)
+                        res.update(chapter=chapter, func=func_name, error=None)
+                        add_history("Thị giác máy", f"{chapter} - {func_name} ({res['elapsed']:.2f}s)")
+                    except Exception as ex:
+                        res = {"chapter": chapter, "func": func_name, "error": f"{type(ex).__name__}: {ex}"}
+                st.session_state.mv_result = res
+
+        res = st.session_state.get("mv_result")
+        if res:
+            st.divider()
+            st.subheader(f"Kết quả gần nhất: {res['chapter']} • {res['func']}")
+            if res["error"]:
+                st.error(f"Lỗi khi chạy: {res['error']}")
+                st.caption("Gợi ý: các hàm có điểm mồi/toạ độ cố định hoặc cần ảnh nhị phân phải dùng đúng ảnh mẫu của bài.")
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    mv_show(res["src"], "Đầu vào")
+                with c2:
+                    mv_show(res["out"], "Kết quả")
+
+                m1, m2 = st.columns(2)
+                m1.metric("Thời gian chạy", f"{res['elapsed']:.2f} s")
+                if res["count"] is not None:
+                    m2.metric("Số thành phần liên thông", res["count"])
+
+                if res["log"].strip():
+                    with st.expander("Nhật ký (print trong code chương)"):
+                        st.code(res["log"])
+
+                ok, png = cv2.imencode(".png", mv_to_uint8(res["out"]))
+                if ok:
+                    st.download_button("⬇️ Tải ảnh kết quả (PNG)", data=png.tobytes(),
+                                       file_name=f"{res['func'].replace(' ', '_')}.png", mime="image/png")
+
+# =========================================================
+# EXTRA
+# =========================================================
+elif menu == "🚀 Nội dung mở rộng":
+    st.title("🚀 Nội dung mở rộng")
+    EXTRA_COUNT = "🍎 Đếm & thống kê trái cây"
+    EXTRA_EYE = "👁️ Phân loại bệnh về mắt"
+    extra_choice = st.radio("Chọn nội dung", [EXTRA_COUNT, EXTRA_EYE], horizontal=True, key="extra_choice")
+    st.divider()
+
+    if extra_choice == EXTRA_COUNT:
+        st.caption("Đếm & thống kê số lượng từng loại trái cây • dùng lại model best.pt")
+        st.info(
+            "Dùng lại model `best.pt` đã tự train ở mục 4 (không dùng model có sẵn), "
+            "chỉ thêm bước đếm/thống kê. Vì không có tracking (theo dõi ID qua từng khung hình), "
+            "khi xử lý video, một vật thể đứng yên qua nhiều khung sẽ được đếm lặp lại ở mỗi khung — "
+            "số liệu phản ánh số lượt phát hiện, không phải số vật thể thực duy nhất."
+        )
+
+        count_model, count_model_path = load_yolo("best.pt")
+        if count_model is None:
+            st.error(
+                "Không tìm thấy `best.pt`. Đặt file này cạnh `app.py`, "
+                "hoặc trong thư mục `models/best.pt`."
+            )
+        else:
+            st.caption(f"Đang dùng model: `{count_model_path}` • Các lớp: " +
+                      ", ".join(count_model.names.values()))
+
+            input_mode = st.radio("Nguồn dữ liệu", ["Một ảnh", "Nhiều ảnh", "Video"],
+                                  horizontal=True, key="count_mode")
+            count_conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01, key="count_conf")
+
+            # ---------- Một ảnh ----------
+            if input_mode == "Một ảnh":
+                uploaded = st.file_uploader(
+                    "Upload ảnh", type=["jpg", "jpeg", "png", "bmp"], key="count_one_upload",
+                )
+                if uploaded is not None:
+                    img = Image.open(uploaded).convert("RGB")
+                    st.image(img, caption="Ảnh đầu vào", use_container_width=True)
+
+                    if st.button("🔢 Đếm", type="primary"):
+                        out_rgb, table = yolo_predict_and_draw(count_model, img, count_conf)
+                        counts = Counter(r["Lớp"] for r in table)
+                        st.image(out_rgb, caption=f"Tổng {sum(counts.values())} đối tượng",
+                                 use_container_width=True)
+                        if counts:
+                            st.bar_chart(counts)
+                            st.dataframe(
+                                [{"Loại": k, "Số lượng": v} for k, v in counts.items()],
+                                use_container_width=True, hide_index=True,
+                            )
+                            add_history("Đếm trái cây",
+                                       ", ".join(f"{k}: {v}" for k, v in counts.items()))
+                        else:
+                            st.warning("Không phát hiện đối tượng nào.")
+
+            # ---------- Nhiều ảnh ----------
+            elif input_mode == "Nhiều ảnh":
+                uploaded_files = st.file_uploader(
+                    "Upload nhiều ảnh", type=["jpg", "jpeg", "png", "bmp"],
+                    accept_multiple_files=True, key="count_multi_upload",
+                )
+                if uploaded_files:
+                    st.caption(f"Đã chọn {len(uploaded_files)} ảnh")
+                    if st.button("🔢 Đếm tất cả", type="primary"):
+                        total_counts = Counter()
+                        rows = []
+                        progress = st.progress(0.0)
+                        for i, f in enumerate(uploaded_files):
+                            img = Image.open(f).convert("RGB")
+                            _, table = yolo_predict_and_draw(count_model, img, count_conf)
+                            c = Counter(r["Lớp"] for r in table)
+                            total_counts.update(c)
+                            rows.append({"Ảnh": f.name, "Tổng": sum(c.values()), **c})
+                            progress.progress((i + 1) / len(uploaded_files))
+
+                        st.subheader("Tổng số lượng theo loại (tất cả ảnh)")
+                        if total_counts:
+                            st.bar_chart(total_counts)
+                            st.dataframe(
+                                [{"Loại": k, "Số lượng": v} for k, v in total_counts.items()],
+                                use_container_width=True, hide_index=True,
+                            )
+                            with st.expander("Chi tiết từng ảnh"):
+                                st.dataframe(pd.DataFrame(rows).fillna(0), use_container_width=True, hide_index=True)
+                            add_history("Đếm trái cây (nhiều ảnh)",
+                                       f"{len(uploaded_files)} ảnh — " +
+                                       ", ".join(f"{k}: {v}" for k, v in total_counts.items()))
+                        else:
+                            st.warning("Không phát hiện đối tượng nào trong các ảnh đã chọn.")
+
+            # ---------- Video ----------
+            else:
+                uploaded_video = st.file_uploader(
+                    "Upload video", type=["mp4", "avi", "mov", "mkv"], key="count_video_upload",
+                )
+                c1, c2 = st.columns(2)
+                sample_every = c1.slider("Xử lý 1 khung mỗi N khung hình", 1, 30, 5, key="count_sample_every",
+                                         help="Tăng N để chạy nhanh hơn, giảm độ chi tiết theo thời gian.")
+                max_frames = c2.slider("Số khung tối đa xử lý", 10, 500, 100, 10, key="count_max_frames")
+
+                if uploaded_video is not None and st.button("🔢 Xử lý video", type="primary"):
+                    tfile = tempfile.NamedTemporaryFile(
+                        delete=False, suffix=os.path.splitext(uploaded_video.name)[1])
+                    tfile.write(uploaded_video.read())
+                    tfile.close()
+
+                    cap = cv2.VideoCapture(tfile.name)
+                    total_counts = Counter()
+                    timeline = []
+                    frame_idx, processed = 0, 0
+                    progress = st.progress(0.0)
+                    preview_slot = st.empty()
+
+                    while processed < max_frames:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        if frame_idx % sample_every == 0:
+                            img_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            out_rgb, table = yolo_predict_and_draw(count_model, img_rgb, count_conf)
+                            c = Counter(r["Lớp"] for r in table)
+                            total_counts.update(c)
+                            timeline.append({"Khung hình": frame_idx, **c})
+                            processed += 1
+                            progress.progress(processed / max_frames)
+                            preview_slot.image(out_rgb, caption=f"Khung hình #{frame_idx}",
+                                              use_container_width=True)
+                        frame_idx += 1
+
+                    cap.release()
+                    os.unlink(tfile.name)
+
+                    st.subheader(f"Đã xử lý {processed} khung hình (trong tổng {frame_idx} khung đã đọc)")
+                    if total_counts:
+                        st.bar_chart(total_counts)
+                        st.dataframe(
+                            [{"Loại": k, "Số lượt phát hiện": v} for k, v in total_counts.items()],
+                            use_container_width=True, hide_index=True,
+                        )
+                        if timeline:
+                            df_timeline = pd.DataFrame(timeline).fillna(0).set_index("Khung hình")
+                            st.line_chart(df_timeline)
+                        add_history("Đếm trái cây (video)",
+                                   f"{processed} khung — " +
+                                   ", ".join(f"{k}: {v}" for k, v in total_counts.items()))
+                    else:
+                        st.warning("Không phát hiện đối tượng nào trong video.")
+
+    else:
+        st.caption("Phân loại bệnh về mắt từ ảnh đáy mắt • EfficientNetB5 (Keras) • train trên Kaggle")
+        st.warning("Chỉ phục vụ học tập, không thay thế chẩn đoán của bác sĩ.")
+
+        with st.expander("📊 Thông tin model (từ kết quả train trên tập validation)"):
+            st.dataframe(pd.DataFrame({
+                "Lớp": ["cataract", "diabetic_retinopathy", "glaucoma", "normal"],
+                "Precision": [0.92, 0.89, 0.90, 0.90],
+                "Recall": [0.93, 0.99, 0.81, 0.88],
+                "F1": [0.92, 0.94, 0.85, 0.89],
+                "Số ảnh": [202, 214, 205, 222],
+            }), use_container_width=True, hide_index=True)
+            st.caption("Accuracy tổng 0.90 trên 843 ảnh validation. Lớp glaucoma có recall thấp nhất (0.81).")
+
+        with st.expander("⚙️ Cấu hình"):
+            e1, e2 = st.columns(2)
+            eye_threshold = e1.slider("Độ tin cậy tối thiểu (%)", 0.0, 100.0, 30.0, 1.0, key="eye_thr",
+                                      help="Dưới ngưỡng này kết quả là 'Cần kiểm tra lại'.")
+            eye_diabetic = e2.slider("Ngưỡng cảnh báo tiểu đường", 0.0, 1.0, 0.30, 0.05, key="eye_dia",
+                                     help="Nếu xác suất tiểu đường vượt ngưỡng này thì cảnh báo, kể cả khi lớp cao nhất là lớp khác.")
+
+        eye_path = find_model_file(EYE_MODEL_FILE)
+        eye_model, eye_err = None, None
+        if eye_path is None:
+            eye_err = (f"Không tìm thấy `{EYE_MODEL_FILE}`. Tải file từ Kaggle (tab Output của notebook) "
+                       "rồi đặt cạnh `app.py` hoặc trong thư mục `models/`.")
+        else:
+            try:
+                eye_model = load_eye_model(eye_path)
+            except ImportError:
+                eye_err = "Chưa cài TensorFlow. Chạy: `pip install tensorflow`"
+            except Exception as e:
+                eye_err = f"Không load được model: {e}"
+
+        if eye_err:
+            st.error(eye_err)
+        else:
+            st.caption(f"Đang dùng model: `{eye_path}`")
+            eye_up = st.file_uploader("Upload ảnh đáy mắt", type=["jpg", "jpeg", "png", "bmp"], key="eye_upload")
+            if eye_up is not None:
+                eye_img = Image.open(eye_up).convert("RGB")
+                st.image(eye_img, caption="Ảnh đầu vào", use_container_width=True)
+
+                if st.button("🔍 Phân tích", type="primary", key="eye_run"):
+                    with st.spinner("Đang phân tích..."):
+                        r = predict_eye(eye_model, eye_img, eye_threshold, eye_diabetic)
+                    if r["status"] == "warning":
+                        st.warning(f"⚠️ {r['text']} ({r['conf']:.1f}%) — xác suất tiểu đường vượt ngưỡng "
+                                   f"{eye_diabetic*100:.0f}% dù lớp cao nhất là {EYE_VI[r['top']]}.")
+                    elif r["status"] == "uncertain":
+                        st.info(f"❔ {r['text']} (độ tin cậy cao nhất chỉ {r['conf']:.1f}%)")
+                    else:
+                        (st.success if r["top"] == "normal" else st.error)(f"{r['text']} ({r['conf']:.1f}%)")
+
+                    prob_df = pd.DataFrame({
+                        "Tình trạng": [EYE_VI[c] for c in EYE_CLASSES],
+                        "Xác suất (%)": [round(float(p) * 100, 2) for p in r["probs"]],
+                    })
+                    st.dataframe(prob_df, use_container_width=True, hide_index=True)
+                    st.bar_chart(prob_df.set_index("Tình trạng"))
+                    add_history("Bệnh về mắt", f"{r['text']} ({r['conf']:.1f}%)")
+
+# =========================================================
+# SETTINGS
+# =========================================================
+elif menu == "⚙️ Cài đặt":
+    st.title("⚙️ Cài đặt")
+
+    st.subheader("Thông tin phiên chạy")
+    st.write("Python / Streamlit environment đang chạy local.")
+
+    if st.button("🗑️ Xóa lịch sử phiên"):
+        st.session_state.history = []
+        st.success("Đã xóa lịch sử.")
+
+    st.subheader("Lịch sử")
+    if st.session_state.history:
+        df = pd.DataFrame(st.session_state.history)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Tải lịch sử CSV",
+            data=csv,
+            file_name="history.csv",
+            mime="text/csv",
+        )
+    else:
+        st.caption("Chưa có lịch sử.")
+
+st.divider()
+st.caption("Computer Vision Project • Streamlit Localhost")
